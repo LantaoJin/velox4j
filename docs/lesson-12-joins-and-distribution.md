@@ -12,6 +12,7 @@ After this lesson you should be able to:
 - Design a distributed join strategy using Velox4J as the local execution engine
 - Use `hashPartition()` and `hashPartitionAndSerialize()` for consistent shuffle partitioning
 - Understand lazy vector materialization and when to flatten before serialization
+- Use `LocalPartitionNode` for in-process repartitioning within a Velox plan tree
 
 ---
 
@@ -918,7 +919,76 @@ The key difference from shuffle join: the build side (small table) is **replicat
 
 ---
 
-## 12.12 Composing Joins with Other Plan Nodes
+## 12.12 LocalPartitionNode — In-Process Repartitioning
+
+Instead of partitioning data in Java via custom JNI functions, Velox4J also exposes Velox's built-in `LocalPartitionNode`. This lets you express repartitioning **directly in the plan tree**, where Velox handles the partitioning internally using `LocalExchangeQueue` — no serialization, no JNI round-trips, no manual lazy vector flattening.
+
+![LocalPartitionNode Data Flow](local-partition-flow.png)
+
+### The plan node
+
+```java
+LocalPartitionNode localPartition = new LocalPartitionNode(
+    "lp-1",
+    LocalPartitionNode.Type.REPARTITION,  // or GATHER for N-to-1
+    false,                                 // scaleWriter
+    new HashPartitionFunctionSpec(
+        inputType,                         // RowType of the input
+        List.of(joinKeyColumnIndex)),      // column indices to hash on
+    List.of(sourceNode)                    // source plan nodes
+);
+```
+
+### PartitionFunctionSpec hierarchy
+
+| Spec | Use case | Fields |
+|------|----------|--------|
+| `HashPartitionFunctionSpec` | Shuffle by key — same key always maps to same partition | `inputType` (RowType), `keyChannels` (List\<Integer\>), `constants` (List\<ConstantTypedExpr\>) |
+| `GatherPartitionFunctionSpec` | N-to-1 gather | None |
+| `RoundRobinPartitionFunctionSpec` | Even distribution | None |
+
+### LocalPartitionNode vs hashPartitionAndSerialize
+
+| | `LocalPartitionNode` | `hashPartitionAndSerialize()` |
+|---|---|---|
+| **Where** | Inside the Velox plan tree | Java/JNI, outside the plan |
+| **Serialization** | None — vectors stay in `LocalExchangeQueue` | Yes — `saveVector()` to `byte[]` for network transfer |
+| **Lazy vectors** | Handled by Velox operators internally | Must flatten explicitly before partitioning |
+| **Use case** | Local repartitioning within a single Velox task | Cross-node shuffle where data must travel over the network |
+| **Backpressure** | Built-in via `LocalExchangeMemoryManager` | Manual — framework manages buffering |
+
+Both are complementary: use `LocalPartitionNode` for in-process repartitioning, `hashPartitionAndSerialize()` for the network shuffle path.
+
+### Example: join with local repartitioning
+
+```java
+// Build plan: repartition both sides by join key, then join
+TableScanNode leftScan = new TableScanNode("left-scan", leftSchema,
+    new ExternalStreamTableHandle("connector-external-stream"), List.of());
+TableScanNode rightScan = new TableScanNode("right-scan", rightSchema,
+    new ExternalStreamTableHandle("connector-external-stream"), List.of());
+
+LocalPartitionNode leftPartition = new LocalPartitionNode(
+    "lp-left", LocalPartitionNode.Type.REPARTITION, false,
+    new HashPartitionFunctionSpec(leftSchema, List.of(joinKeyIndex)),
+    List.of(leftScan));
+
+LocalPartitionNode rightPartition = new LocalPartitionNode(
+    "lp-right", LocalPartitionNode.Type.REPARTITION, false,
+    new HashPartitionFunctionSpec(rightSchema, List.of(joinKeyIndex)),
+    List.of(rightScan));
+
+HashJoinNode join = new HashJoinNode("join-1", JoinType.INNER,
+    List.of(FieldAccessTypedExpr.create(keyType, "join_key")),
+    List.of(FieldAccessTypedExpr.create(keyType, "join_key")),
+    null, leftPartition, rightPartition, outputType, false, false);
+```
+
+**Source:** `src/main/java/org/boostscale/velox4j/plan/LocalPartitionNode.java`, `src/main/java/org/boostscale/velox4j/plan/partition/`
+
+---
+
+## 12.13 Composing Joins with Other Plan Nodes
 
 Hash joins compose naturally with other plan nodes. Here are common patterns.
 
@@ -978,7 +1048,7 @@ For multi-way joins, each `HashJoinNode` has exactly 2 sources. Nested joins for
 
 ---
 
-## 12.13 Key Takeaways
+## 12.14 Key Takeaways
 
 1. **Velox4J exposes `HashJoinNode`** — the most versatile join, supporting 9 join types via `JoinType` enum. The `AbstractJoinNode` base class makes it easy to add `MergeJoinNode` in the future.
 
@@ -1000,9 +1070,11 @@ For multi-way joins, each `HashJoinNode` has exactly 2 sources. Nested joins for
 
 10. **Lazy vectors must be flattened** before serialization or feeding into a new plan. `hashPartition()` and `hashPartitionAndSerialize()` flatten automatically. Direct use of `serializeOneToBuf()` or `BlockingQueue.put()` requires calling `flattenedVector()` first on data from Parquet scans.
 
+11. **`LocalPartitionNode` enables in-process repartitioning** directly in the Velox plan tree. Unlike `hashPartitionAndSerialize()` (which is for cross-node shuffle), `LocalPartitionNode` uses `LocalExchangeQueue` — no serialization, no manual lazy vector handling, with built-in backpressure. Supports three modes via `PartitionFunctionSpec`: hash, gather, and round-robin.
+
 ---
 
-## 12.14 Exercises
+## 12.15 Exercises
 
 1. **Build a join plan**: Write Java code for a hash join between an `orders` table `(order_id BIGINT, customer_id BIGINT, total DOUBLE)` and a `customers` table `(id BIGINT, name VARCHAR)` on `customer_id = id`. Include a post-join filter for `total > 100.0`.
 
@@ -1015,7 +1087,7 @@ For multi-way joins, each `HashJoinNode` has exactly 2 sources. Nested joins for
            └── TableScanNode("scan-B")
    ```
 
-3. **Multi-way join splits**: For the three-way join in section 12.12, list all the `addSplit()` and `noMoreSplits()` calls needed. What happens if you forget `noMoreSplits("scan-supplier")`?
+3. **Multi-way join splits**: For the three-way join in section 12.13, list all the `addSplit()` and `noMoreSplits()` calls needed. What happens if you forget `noMoreSplits("scan-supplier")`?
 
 4. **Trace the serial execution**: Using the timeline from section 12.4, describe what happens when you call `advance()` after all splits are added for a hash join. What state does it return first? Why?
 
@@ -1028,6 +1100,8 @@ For multi-way joins, each `HashJoinNode` has exactly 2 sources. Nested joins for
 8. **Lazy vector trap**: You scan a Parquet file, get a `RowVector`, serialize it with `BaseVectors.serializeOneToBuf(batch)`, deserialize with `deserializeOneFromBuf(buf)`, and feed it into a `BlockingQueue` for a HashJoin. It crashes with "lazy vector should not have been loaded." Where is the bug and how do you fix it?
 
 9. **Broadcast vs shuffle**: An MPP engine joins a 100M-row `orders` table with a 50-row `regions` table. Compare the network bytes transferred for broadcast join vs shuffle join with 4 partitions. Which should the query planner choose?
+
+10. **LocalPartitionNode plan**: Write the Java code to build a plan that scans two ExternalStream sources, repartitions both by column 0 using `LocalPartitionNode` with `HashPartitionFunctionSpec`, and joins them with `HashJoinNode`. Compare this to the equivalent plan using `hashPartitionAndSerialize()` + `BlockingQueue` — which has fewer JNI calls?
 
 ---
 
