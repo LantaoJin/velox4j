@@ -10,7 +10,7 @@ After this lesson you should be able to:
 - Describe the full Velox distributed shuffle architecture: PartitionedOutput → OutputBufferManager → ExchangeClient → Exchange
 - Explain why Velox4J cannot support Exchange/PartitionedOutput and how frameworks like Gluten-Flink work around this
 - Design a distributed join strategy using Velox4J as the local execution engine
-- Use `hashPartition()` and `hashPartitionAndSerialize()` for consistent shuffle partitioning
+- Use `partitionByKeyHashes()` for consistent shuffle partitioning
 - Understand lazy vector materialization and when to flatten before serialization
 - Use `LocalPartitionNode` for in-process repartitioning within a Velox plan tree
 
@@ -733,57 +733,55 @@ A key requirement for distributed shuffle is that the **same key always maps to 
 | API | Algorithm | Cross-node consistent? | Use case |
 |-----|-----------|----------------------|----------|
 | `partitionByKeys()` | Hive `PartitionIdGenerator` (discovery-based) | **No** — assigns sequential IDs as it discovers distinct values | Local grouping (e.g., writing to Hive partitions) |
-| `hashPartition()` | Velox `HashPartitionFunction` (hash-based) | **Yes** — deterministic hash of key values | Distributed shuffle |
+| `partitionByKeyHashes()` | Velox `HashPartitionFunction` (hash-based) | **Yes** — deterministic hash of key values | Distributed shuffle |
 
 ```java
 // Hash-partition by join key column (index 2) into 4 partitions
 List<RowVector> partitions = session.rowVectorOps()
-    .hashPartition(rowVector, List.of(2), 4);
+    .partitionByKeyHashes(rowVector, List.of(2), 4);
 // partitions.get(i) is null if no rows hashed to partition i
 ```
 
 **Source:** `src/main/java/org/boostscale/velox4j/data/RowVectors.java`
 
-### Combined partition-and-serialize
+### Partition then serialize
 
-For shuffle send, the framework needs to partition data and serialize each partition for network transfer. The `hashPartitionAndSerialize()` API does both in a **single JNI call**:
+For shuffle send, the framework needs to partition data and serialize each partition for network transfer. Use `partitionByKeyHashes()` to partition, then `BaseVectors.serializeOneToBuf()` to serialize each partition separately:
 
 ```java
-// Partition + serialize in one call — returns byte[][] indexed by partition
-byte[][] serialized = session.rowVectorOps()
-    .hashPartitionAndSerialize(rowVector, List.of(joinKeyIndex), numPartitions);
+// Partition by join key
+List<RowVector> partitions = session.rowVectorOps()
+    .partitionByKeyHashes(rowVector, List.of(joinKeyIndex), numPartitions);
 
-// Send each non-null partition to its target node
-for (int i = 0; i < serialized.length; i++) {
-    if (serialized[i] != null) {
-        sendToNode(targetNodes[i], serialized[i]);  // framework's network layer
+// Serialize and send each non-null partition to its target node
+for (int i = 0; i < partitions.size(); i++) {
+    if (partitions.get(i) != null) {
+        byte[] buf = BaseVectors.serializeOneToBuf(partitions.get(i));
+        sendToNode(targetNodes[i], buf);  // framework's network layer
     }
 }
 ```
-
-This avoids materializing intermediate `RowVector` objects in the `ObjectStore` — the C++ code partitions, wraps, and serializes in one pass.
 
 The serialization uses Velox's native binary format (`VectorSaver`), the same format used by `BaseVectors.serializeOneToBuf()` / `deserializeOneFromBuf()`.
 
 ### The ShuffleWriter C++ abstraction
 
-The `hashPartition()` and `hashPartitionAndSerialize()` JNI functions are thin wrappers over the `ShuffleWriter` class — Velox4J's serial-mode equivalent of Velox's `PartitionedOutput` operator:
+The `partitionByKeyHashes()` JNI function is a thin wrapper over the `ShuffleWriter` class — Velox4J's serial-mode equivalent of Velox's `PartitionedOutput` operator:
 
 ```
 Velox parallel mode:  PartitionedOutput → OutputBufferManager → ExchangeNode
-Velox serial mode:    ShuffleWriter → byte[] via JNI → framework network transport
+Velox serial mode:    ShuffleWriter → RowVector[] via JNI → serialize in Java → framework transport
 In-process:           LocalPartitionNode → LocalExchangeQueue
 ```
 
-`ShuffleWriter` encapsulates the entire partition + serialize pipeline:
+`ShuffleWriter` encapsulates the partition pipeline:
 
 1. **Flatten** lazy columns (via `flattenVector()`)
 2. **Hash** each row to a partition (via `HashPartitionFunction`)
 3. **Index** rows per partition (allocate row index buffers)
 4. **Wrap** each partition as a `RowVector` (via `exec::wrap()`)
-5. **Serialize** each partition (via `saveVector()`) — only for `partitionAndSerialize()`
 
-The class is reusable across batches and independently testable in C++ GTests without JNI.
+Serialization is done separately via `BaseVectors.serializeOneToBuf()`, keeping partitioning and serialization decoupled.
 
 **Source:** `src/main/cpp/main/velox4j/shuffle/ShuffleWriter.h`, `src/main/cpp/main/velox4j/shuffle/ShuffleWriter.cc`
 
@@ -794,16 +792,14 @@ When data is scanned from Parquet via the Hive connector, Velox produces `RowVec
 ```
 Scan Parquet → RowVector with lazy columns
     │
-    ├── hashPartition() → automatically flattens (safe)
-    │
-    ├── hashPartitionAndSerialize() → automatically flattens (safe)
+    ├── partitionByKeyHashes() → automatically flattens (safe)
     │
     ├── BaseVectors.serializeOneToBuf() → does NOT flatten (caller must flatten)
     │
     └── BlockingQueue.put() → does NOT flatten (caller must flatten)
 ```
 
-Both `hashPartition()` and `hashPartitionAndSerialize()` call `flattenVector()` internally to materialize lazy columns before partitioning. But if you use `serializeOneToBuf()` or `BlockingQueue.put()` directly (e.g., for broadcast join), you must flatten first:
+`partitionByKeyHashes()` calls `flattenVector()` internally to materialize lazy columns before partitioning. But if you use `serializeOneToBuf()` or `BlockingQueue.put()` directly (e.g., for broadcast join), you must flatten first:
 
 ```java
 // WRONG — lazy columns cause crash in downstream HashBuild
@@ -840,11 +836,12 @@ Iterator<RowVector> localData = veloxExecutor.executeScan(scanPlan, shards);
 // Hash-partition and serialize for shuffle
 while (localData.hasNext()) {
     RowVector batch = localData.next();
-    byte[][] partitions = session.rowVectorOps()
-        .hashPartitionAndSerialize(batch, List.of(joinKeyIndex), numPartitions);
-    for (int i = 0; i < partitions.length; i++) {
-        if (partitions[i] != null) {
-            sendToNode(targetNodes[i], partitions[i]);  // framework transport
+    List<RowVector> partitions = session.rowVectorOps()
+        .partitionByKeyHashes(batch, List.of(joinKeyIndex), numPartitions);
+    for (int i = 0; i < partitions.size(); i++) {
+        if (partitions.get(i) != null) {
+            byte[] buf = BaseVectors.serializeOneToBuf(partitions.get(i));
+            sendToNode(targetNodes[i], buf);  // framework transport
         }
     }
 }
@@ -969,17 +966,17 @@ LocalPartitionNode localPartition = new LocalPartitionNode(
 
 ### Three repartitioning mechanisms compared
 
-| | `LocalPartitionNode` | `ShuffleWriter` / `hashPartitionAndSerialize()` | Velox `PartitionedOutput` |
+| | `LocalPartitionNode` | `partitionByKeyHashes()` + `serializeOneToBuf()` | Velox `PartitionedOutput` |
 |---|---|---|---|
-| **Where** | Inside the Velox plan tree | C++ class called via JNI | Inside Velox plan tree (parallel mode only) |
+| **Where** | Inside the Velox plan tree | Java API over `ShuffleWriter` C++ class | Inside Velox plan tree (parallel mode only) |
 | **Execution mode** | Serial ✅ | Serial ✅ | Parallel only ❌ |
-| **Serialization** | None — vectors stay in `LocalExchangeQueue` | Yes — `saveVector()` to `byte[]` | Yes — to `OutputBufferManager` |
+| **Serialization** | None — vectors stay in `LocalExchangeQueue` | Yes — `serializeOneToBuf()` to `byte[]` | Yes — to `OutputBufferManager` |
 | **Network transfer** | No — in-process only | Yes — `byte[]` returned to Java for framework transport | Yes — via `ExchangeSource` (HTTP in Prestissimo) |
-| **Lazy vectors** | Handled by Velox internally | `ShuffleWriter` flattens automatically | Handled by Velox internally |
+| **Lazy vectors** | Handled by Velox internally | `partitionByKeyHashes()` flattens automatically | Handled by Velox internally |
 | **Backpressure** | Built-in via `LocalExchangeMemoryManager` | Manual — framework manages buffering | Built-in via `OutputBufferManager` |
 | **Use case** | Repartition within a single Velox task | Cross-node shuffle for MPP engines using serial mode | Cross-node shuffle in Presto/Prestissimo |
 
-`LocalPartitionNode` and `ShuffleWriter` are complementary — use `LocalPartitionNode` when downstream consumers are Velox operators in the same plan, use `ShuffleWriter` when data must cross the network.
+`LocalPartitionNode` and `partitionByKeyHashes()` are complementary — use `LocalPartitionNode` when downstream consumers are Velox operators in the same plan, use `partitionByKeyHashes()` when data must cross the network.
 
 ### Example: join with local repartitioning
 
@@ -1086,13 +1083,13 @@ For multi-way joins, each `HashJoinNode` has exactly 2 sources. Nested joins for
 
 7. **Exchange and PartitionedOutput are blocked in serial mode** because `DriverFactory::supportsSerialExecution()` returns false when either is present. This is fundamental — these operators are async sinks/sources incompatible with the pull-based `Task::next()` API.
 
-8. **Frameworks handle shuffle externally** using Velox4J's shuffle primitives. The `ShuffleWriter` C++ class (exposed via `hashPartition()` and `hashPartitionAndSerialize()` JNI APIs) is the serial-mode equivalent of Velox's `PartitionedOutput` — it handles flatten, hash, wrap, and serialize in a single abstraction. `ExternalStream` + `BlockingQueue` feeds shuffled data into local joins.
+8. **Frameworks handle shuffle externally** using Velox4J's shuffle primitives. `partitionByKeyHashes()` (backed by the `ShuffleWriter` C++ class) handles flatten, hash, and wrap. Serialization is done separately via `BaseVectors.serializeOneToBuf()`. `ExternalStream` + `BlockingQueue` feeds shuffled data into local joins.
 
-9. **`hashPartition()` uses `HashPartitionFunction`** (deterministic hash), not `PartitionIdGenerator` (discovery-based). Same key → same partition on every node — a hard requirement for distributed shuffle.
+9. **`partitionByKeyHashes()` uses `HashPartitionFunction`** (deterministic hash), not `PartitionIdGenerator` (discovery-based). Same key → same partition on every node — a hard requirement for distributed shuffle.
 
-10. **Lazy vectors must be flattened** before serialization or feeding into a new plan. `hashPartition()` and `hashPartitionAndSerialize()` flatten automatically. Direct use of `serializeOneToBuf()` or `BlockingQueue.put()` requires calling `flattenedVector()` first on data from Parquet scans.
+10. **Lazy vectors must be flattened** before serialization or feeding into a new plan. `partitionByKeyHashes()` flattens automatically. Direct use of `serializeOneToBuf()` or `BlockingQueue.put()` requires calling `flattenedVector()` first on data from Parquet scans.
 
-11. **`LocalPartitionNode` enables in-process repartitioning** directly in the Velox plan tree. Unlike `hashPartitionAndSerialize()` (which is for cross-node shuffle), `LocalPartitionNode` uses `LocalExchangeQueue` — no serialization, no manual lazy vector handling, with built-in backpressure. Supports three modes via `PartitionFunctionSpec`: hash, gather, and round-robin.
+11. **`LocalPartitionNode` enables in-process repartitioning** directly in the Velox plan tree. Unlike `partitionByKeyHashes()` (which is for cross-node shuffle), `LocalPartitionNode` uses `LocalExchangeQueue` — no serialization, no manual lazy vector handling, with built-in backpressure. Supports three modes via `PartitionFunctionSpec`: hash, gather, and round-robin.
 
 ---
 
@@ -1117,13 +1114,13 @@ For multi-way joins, each `HashJoinNode` has exactly 2 sources. Nested joins for
 
 6. **Add MergeJoinNode**: Based on sections 12.5 and 4.12, list every file you'd create or modify to add `MergeJoinNode` to Velox4J. Write the Java class, the registration call, and a serde test.
 
-7. **Shuffle consistency**: Two nodes each scan different halves of a table and call `hashPartitionAndSerialize(data, List.of(0), 4)`. Will row with key=42 always land in the same partition index on both nodes? Why? What would happen if they used `partitionByKeys()` instead?
+7. **Shuffle consistency**: Two nodes each scan different halves of a table and call `partitionByKeyHashes(data, List.of(0), 4)`. Will row with key=42 always land in the same partition index on both nodes? Why? What would happen if they used `partitionByKeys()` instead?
 
 8. **Lazy vector trap**: You scan a Parquet file, get a `RowVector`, serialize it with `BaseVectors.serializeOneToBuf(batch)`, deserialize with `deserializeOneFromBuf(buf)`, and feed it into a `BlockingQueue` for a HashJoin. It crashes with "lazy vector should not have been loaded." Where is the bug and how do you fix it?
 
 9. **Broadcast vs shuffle**: An MPP engine joins a 100M-row `orders` table with a 50-row `regions` table. Compare the network bytes transferred for broadcast join vs shuffle join with 4 partitions. Which should the query planner choose?
 
-10. **LocalPartitionNode plan**: Write the Java code to build a plan that scans two ExternalStream sources, repartitions both by column 0 using `LocalPartitionNode` with `HashPartitionFunctionSpec`, and joins them with `HashJoinNode`. Compare this to the equivalent plan using `hashPartitionAndSerialize()` + `BlockingQueue` — which has fewer JNI calls?
+10. **LocalPartitionNode plan**: Write the Java code to build a plan that scans two ExternalStream sources, repartitions both by column 0 using `LocalPartitionNode` with `HashPartitionFunctionSpec`, and joins them with `HashJoinNode`. Compare this to the equivalent plan using `partitionByKeyHashes()` + `serializeOneToBuf()` + `BlockingQueue` — which has fewer JNI calls?
 
 ---
 
